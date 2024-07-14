@@ -3,8 +3,12 @@ package auth
 import (
 	"database/sql"
 	"encoding/json"
+	"golang.org/x/crypto/bcrypt"
 	"log"
 	"net/http"
+	"time"
+
+	"github.com/lib/pq"
 )
 
 func RegisterHandler(db *sql.DB) http.HandlerFunc {
@@ -17,18 +21,28 @@ func RegisterHandler(db *sql.DB) http.HandlerFunc {
 		var creds UserCredentials
 		err := json.NewDecoder(r.Body).Decode(&creds)
 		if err != nil {
+			log.Printf("Error decoding request body: %v", err)
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
 
 		hashedPassword, err := HashPassword(creds.Password)
 		if err != nil {
+			log.Printf("Error hashing password: %v", err)
 			http.Error(w, "Error hashing password", http.StatusInternalServerError)
 			return
 		}
 
 		_, err = db.Exec("INSERT INTO users (username, password) VALUES ($1, $2)", creds.Username, hashedPassword)
 		if err != nil {
+			if pqErr, ok := err.(*pq.Error); ok {
+				if pqErr.Code == "23505" {
+					log.Printf("Error: user already exists: %v", err)
+					http.Error(w, "User already exists", http.StatusConflict)
+					return
+				}
+			}
+			log.Printf("Error saving user to database: %v", err)
 			http.Error(w, "Error saving user to database", http.StatusInternalServerError)
 			return
 		}
@@ -45,38 +59,41 @@ func LoginHandler(db *sql.DB) http.HandlerFunc {
 			return
 		}
 
-		query := r.URL.Query()
-		email := query["email"][0]
-		password := query["password"][0]
-
-		// var creds UserCredentials
-		// err := json.NewDecoder(r.Body).Decode(&creds)
-		// if err != nil {
-		// 	http.Error(w, "Invalid request body", http.StatusBadRequest)
-		// 	return
-		// }
+		var creds UserCredentials
+		err := json.NewDecoder(r.Body).Decode(&creds)
+		if err != nil {
+			http.Error(w, "Invalid request body", http.StatusBadRequest)
+			return
+		}
 
 		var storedPassword string
-		err := db.QueryRow(`SELECT "Password" FROM "Users" WHERE "Email"=$1`, email).Scan(&storedPassword)
+		err = db.QueryRow("SELECT password FROM users WHERE username=$1", creds.Username).Scan(&storedPassword)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				http.Error(w, "User not found", http.StatusUnauthorized)
 			} else {
-				log.Printf("%w", err)
 				http.Error(w, "Database error", http.StatusInternalServerError)
 			}
 			return
 		}
 
-		// if !CheckPasswordHash(creds.Password, storedPassword) {
-		// 	http.Error(w, "Invalid credentials", http.StatusUnauthorized)
-		// 	return
-		// }
-
-		if storedPassword != password {
+		err = bcrypt.CompareHashAndPassword([]byte(storedPassword), []byte(creds.Password))
+		if err != nil {
 			http.Error(w, "Invalid credentials", http.StatusUnauthorized)
 			return
 		}
+
+		token, err := GenerateJWT(creds.Username)
+		if err != nil {
+			http.Error(w, "Error generating token", http.StatusInternalServerError)
+			return
+		}
+
+		http.SetCookie(w, &http.Cookie{
+			Name:    "token",
+			Value:   token,
+			Expires: time.Now().Add(24 * time.Hour),
+		})
 
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Login successful"))
